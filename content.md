@@ -25,7 +25,7 @@ This is now getting parsed by the parser that transforms this code into an AST, 
 
 ## 2. Limitations of the textual inclusion model
 
-Above's example works pretty well and is as optimized as it gets, but that's only because we have only one source files. The situation changes when we have multiple source files or headers that include our `foo.h`. Let's assume we have a second source file called `foo.cpp` implementing the `foo` function and also including the `foo.h`:
+Above's example works pretty well and is as optimized as it gets, but that's only because we have only one source file. The situation changes when we have multiple source files or headers that include our `foo.h`. Let's assume we have a second source file called `foo.cpp` implementing the `foo` function and also including the `foo.h`:
 
     // foo.cpp
     #include "foo.h"
@@ -33,7 +33,7 @@ Above's example works pretty well and is as optimized as it gets, but that's onl
        // lots of code here
     }
 
-When compiling our project now, we would have two spawn two clang processes that both end up have to parse the contents of `foo.h`  and both end up with the same FunctionDecl of `foo` with the same attributes in their AST (1). This means that when compiling our project, the two clang processes perform redundant work when parsing this header.
+When compiling our project now, we would have two spawn two clang processes that both end up have to parse the contents of `foo.h`  and both end up with the same FunctionDecl of `foo` with the same attributes in their AST (\*). This means that when compiling our project, the two clang processes perform redundant work when parsing this header.
 
 But so far the compilation time isn't so bad. The header in our example only contains a simple forward declaration that only takes a few CPU cycles to parse. Even when we include this header hundred of times, we would barely notice that we repeatedly parse this tiny forward declaration - the bigger function body is after all in the source file which we only parse once.
 
@@ -43,13 +43,13 @@ Now we suddenly do notice that we reparse header contents, as the workload for p
 
 The solution for this sounds pretty forward: If we do redundant work, we just have to add a cache inbetween where we store the result of the first parsing process. But things aren't as simple as they sound.
 
-*(1) Actually the FunctionDecls are slightly different, as the FunctionDecl in `foo.cpp` has a redeclaration chain containing the definition and the one in `main.cpp` doesn't, but for a brief moment during parsing they contain FunctionDecls with the same attributes and an empty redeclaration chain.*
+(\*) Actually the FunctionDecls are slightly different, as the FunctionDecl in `foo.cpp` has a redeclaration chain containing the definition and the one in `main.cpp` doesn't, but for a brief moment during parsing they contain FunctionDecls with the same attributes and an empty redeclaration chain.*
 
 ## 3. Precompiled headers
 
 Before jumping into modules, let's look at **p**re**c**ompiled **h**eaders (**PCH**s) which work in a similar way (and are even using the same underlying code in clang).
 
-Even the simplest real-world C++ program includes some the standard C++ headers. These are provided by the implementation and provide basic functionality like writing to stdout/stderr and so on. Yet, they are actually quite large - including the libstdc++ `iostream` header for example provides around 40 000 AST nodes (2)!
+Even the simplest real-world C++ program includes some the standard C++ headers. These are provided by the implementation and provide basic functionality like writing to stdout/stderr and so on. Yet, they are actually quite large - including the libstdc++ `iostream` header for example provides around 40 000 AST nodes (\*)!
 
 As some of these headers like `vector` or `string` are nearly always textually included in an translation unit (either indirectly or directly), we could make an simple optimization and just allow changing the starting point of the parsing process to a point after the those headers are already in the AST.
 
@@ -76,23 +76,107 @@ Imagine we have 1000 headers in our program and we would all serialize them like
 
 So we're stuck again but this time we have some ways to optimize. 
 
+(\*) You can check this by running* `echo "#include <iostream>" | clang++ -Xclang -ast-dump -fsyntax-only -xc++ - | wc -l`
+
 # 4. On-demand deserialization
 
 The first optimizaion that comes to mind is that we don't just load the entire file, but rather construct it like a database containing serialized declarations where the keys are lookups (e.g. the key `std::string` would point to the serialized decl inside this datbase). From this database we now just lazily load the declarations our current source file needs.
 
-This mechanic however require some larger changes in our compiler infrastructure beyond just changing the initial translation unit. We now have an interface to our data base (which we still call a PCH) which clang calls an `ExternalASTSource` and we have multiple calls to this source from various parts of the compiler where loading a declaration could occur. For example the call `requireCompleteType` now also checks if the current ExternalASTSource of the compiler can complete the current type we need a definition of (for example by deserializing the specific type from the PCH and adding it to our AST).
+This mechanic however require some larger changes in our compiler infrastructure beyond just changing the initial translation unit. We now need an interface to our data base (which we still call a PCH) which clang naned `ExternalASTSource` and we have multiple calls to this source from various parts of the compiler where loading a declaration could occur. For example the call `requireCompleteType` now also checks if the current ExternalASTSource of the compiler can provide a definition for the requested type (for example by deserializing the specific type from the PCH and adding it to our AST).
+
+Let's test this in practice. We take a header called `des.h` which we consider the header we want to move to a PCH:
+
+	#ifndef DES_H
+	#define DES_H
+
+	class Des {
+	  int i = 0;
+	public:
+	  Des() { }
+	  int f() { return i; }
+	  void f(int v) { i = v; }
+	};
+
+	#endif
+
+ We serialize it into a clang PCH named `des.pch` via:
+
+    clang++ -cc1 -std=c++11 -xc++ -emit-pch  des.h -o des.pch
+    
+Now we take a source file `des.cpp` that we want to parse using this PCH file:
+
+	#include "des.h"
+
+	int main() {
+	}
+
+As you can see we include this header but don't use any of it's declarations, so if our PCH on-demand derserialization works as intended, clang shouldn't load any declarations from the des.pch. We can test this by compiling with a PCH and passing the flag `-dump-deserialized-decls` like this:
+
+	teemperor@ftldrive ~/C/m/test> clang++ -cc1 -std=c++11 -include-pch des.pch -dump-deserialized-decls des.cpp
+	PCH DECL: TranslationUnit
+
+The `PCH DECL:` notes say which declarations where serialized from the PCH while parsing the current source file. In our case it's only the top-level `TranslationUnitDecl`, which we don't really care about (Note: We only deserialized this decl, but not all of it's children obviously).
+
+Ok, now let's actually use this header and change the `des.cpp` file:
+
+	#include "des.h"
+
+	int main() {
+	  Des d;
+	}
+
+Now we get this when compiling:
+
+	teemperor@ftldrive ~/C/m/test> clang++ -cc1 -std=c++11 -include-pch des.pch -dump-deserialized-decls des.cpp
+	PCH DECL: TranslationUnit
+	PCH DECL: CXXRecord - Des
+	PCH DECL: Field - i
+	PCH DECL: CXXConstructor - Des
+
+As we can see, clang now deserialized the used `Des` declaration from the PCH and added it to our AST. But it also deserialized the `i` member of the `Des` class! So why is that? Because we allocate `Des` on the stack and actually need its member to calculate the memory size here, so we also have to load all members from the class which define the size of their containing class. We can test this assumption by making `Des` a pointer:
+
+
+	#include "des.h"
+
+	int main() {
+	  Des *d;
+	}
+
+Now we only deserialize `Des`, but we don't load it's members:
+
+	teemperor@ftldrive ~/C/m/test> clang++ -cc1 -std=c++11 -include-pch des.pch -dump-deserialized-decls des.cpp
+	PCH DECL: TranslationUnit
+	PCH DECL: CXXRecord - Des
+
+Same goes with any functions we call here. Let's call the member function `f` of `Des` from `des.cpp`:
+
+	#include "des.h"
+
+	int main() {
+	  Des d;
+	  d.f(2);
+	}
+
+Now we also deserialize the member method `f`:
+
+	teemperor@ftldrive ~/C/m/test> clang++ -cc1 -std=c++11 -include-pch des.pch -dump-deserialized-decls des.cpp
+	PCH DECL: TranslationUnit
+	PCH DECL: CXXRecord - Des
+	PCH DECL: Field - i
+	PCH DECL: CXXConstructor - Des
+	PCH DECL: CXXMethod - f
+	PCH DECL: ParmVar - v
+	PCH DECL: CXXMethod - f
+
+As we can see, lazy-loading our declarations solves our performance problem because of having a large and sparsely used PCH. The only remaining problem is that it is still not very flexible: We only have one monolithic file, that we would have to generate by one clang instance in a single process and everytime we change any header, we would have to regenerate this whole file. Ther are also some other issues that aren't as obvious, such as different compilation flags across the project, that we will discuss later that also prevent the PCH from being the perfect alternative for textual inclusion.
+
+## 5. The module compilation process
 
 
 
-*(2) You can check this by running* `echo "#include <iostream>" | clang++ -Xclang -ast-dump -fsyntax-only -xc++ - | wc -l`
+## 6. PCM cache
 
-## 2. The module compilation process
+## 7. Standalone headers
 
-## 3. Entity loading
-
-## 4. PCM cache
-
-## 5. Standalone headers
-
-## 6. Common bugs
+## 8. Common bugs
 
