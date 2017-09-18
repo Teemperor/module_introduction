@@ -78,7 +78,7 @@ So we're stuck again but this time we have some ways to optimize.
 
 (\*) You can check this by running* `echo "#include <iostream>" | clang++ -Xclang -ast-dump -fsyntax-only -xc++ - | wc -l`
 
-# 4. On-demand deserialization
+## 4. On-demand deserialization
 
 The first optimizaion that comes to mind is that we don't just load the entire file, but rather construct it like a database containing serialized declarations where the keys are lookups (e.g. the key `std::string` would point to the serialized decl inside this datbase). From this database we now just lazily load the declarations our current source file needs.
 
@@ -112,7 +112,7 @@ Now we take a source file `des.cpp` that we want to parse using this PCH file:
 
 As you can see we include this header but don't use any of it's declarations, so if our PCH on-demand derserialization works as intended, clang shouldn't load any declarations from the des.pch. We can test this by compiling with a PCH and passing the flag `-dump-deserialized-decls` like this:
 
-	teemperor@ftldrive ~/C/m/test> clang++ -cc1 -std=c++11 -include-pch des.pch -dump-deserialized-decls des.cpp
+	$> clang++ -cc1 -std=c++11 -include-pch des.pch -dump-deserialized-decls des.cpp
 	PCH DECL: TranslationUnit
 
 The `PCH DECL:` notes say which declarations where serialized from the PCH while parsing the current source file. In our case it's only the top-level `TranslationUnitDecl`, which we don't really care about (Note: We only deserialized this decl, but not all of it's children obviously).
@@ -159,7 +159,7 @@ Same goes with any functions we call here. Let's call the member function `f` of
 
 Now we also deserialize the member method `f`:
 
-	teemperor@ftldrive ~/C/m/test> clang++ -cc1 -std=c++11 -include-pch des.pch -dump-deserialized-decls des.cpp
+	$> clang++ -cc1 -std=c++11 -include-pch des.pch -dump-deserialized-decls des.cpp
 	PCH DECL: TranslationUnit
 	PCH DECL: CXXRecord - Des
 	PCH DECL: Field - i
@@ -168,7 +168,79 @@ Now we also deserialize the member method `f`:
 	PCH DECL: ParmVar - v
 	PCH DECL: CXXMethod - f
 
-As we can see, lazy-loading our declarations solves our performance problem because of having a large and sparsely used PCH. The only remaining problem is that it is still not very flexible: We only have one monolithic file, that we would have to generate by one clang instance in a single process and everytime we change any header, we would have to regenerate this whole file. Ther are also some other issues that aren't as obvious, such as different compilation flags across the project, that we will discuss later that also prevent the PCH from being the perfect alternative for textual inclusion.
+As we can see, lazy-loading our declarations solves our performance problem because of having a large and sparsely used PCH. The only remaining problem is that it is still not very flexible: We only have one monolithic file, that we would have to generate by one clang instance in a single process and everytime we change any header, we would have to regenerate this whole file. Ther are also some other issues that aren't as obvious (such as different compilation flags across the project that produce different AST nodes) that we will be discussed later that also prevent the PCH from being the perfect alternative for textual inclusion.
+
+## 5. One definition rule problems (ODR)
+
+There is a simple-looking solution fo the lacking flexibility of the monolithic PCH: We just allow having multiple smaller PCHs and allow attaching them all to one compilation. This way we can just split up the project into multiple groups of headers and just recompile one at a time. While this is indeed the way forward that the modules have taken, it isn't as simple as it looks like.
+
+By allowing this kind of computation, we just changed the way our traditional compilation strategy works. So far we always started from an empty state and then continued to parse inside a single translation unit declarations. Even with the PCH this didn't change as we just "paused" the parsing process after the PCH was parsed and then continued from this state in several translation units.
+
+Let's assume for now we could attach multiple PCHs to one clang invocation (which we can't, but let's do a Gedankenexperiment and try it). Now imagine having two precompiled PCHs: One PCH for `A.h` and one for `B.h` and a third header `C.h` that both `A.h` and `B.h` include:
+```C++
+##### A.h:
+
+#include <C.h>
+int trim(string s) { ... }
+
+##### B.h:
+
+#include <C.h>
+int strlen(string s) { ... }
+
+##### C.h:
+
+struct string {
+  char characters[10];
+};
+
+```
+
+If we now compile both PCHs, we also have to parse C.h twice which means we
+also have two *different* `string` declarations - one in each PCH. If we now
+could attach both PCHs to one compiler invocation we have an AST that has suddenly a redefinition of the `string` struct. Usually this would be an error and we would just error out, but in this case the user was forced redefine `string` this way.
+
+So clang needs to be smart and see that both structs are the same and that
+in this case it was legimitate that `string` was redefined by the user.
+Because solving this problem will be quite complicated, we leave the PCH system as-is and limited to one PCH per compiler invocation. The system
+that has to solve these issues will be the module system.
+
+## 6. Precompiled Modules (PCMs)
+
+Let's start with an example of a simple module compilation:
+
+```
+##### Printer.h
+
+class Printer {
+public:
+  bool tryToPrint(int number);
+};
+
+##### module.modulemap
+
+module Printer { header "Printer.h" export * }
+
+##### main.cpp
+
+#include "Printer.h"
+
+int main() {
+  Printer p;
+  p.tryToPrint(42);
+}
+
+```
+
+When creating these files, note that the `module.modulemap` should be
+placed in the same directory as the `Printer.h` header. We can now compile this with modules using `clang++ -fmodules -fmodules-cache-path=pcms main.cpp`. If we want to compile the same program without
+modules, we can just drop the `-fmodules-*` arguments from the invocation.
+
+Two things should catch the eye of the reader now: First, there is
+no difference in the C++ code between our module compilation and a
+non-modules compilation. This is intentional and all the additional
+information we need to provide for the modules to work is placed
+in the `module.modulemap`.
 
 ## 5. The module compilation process
 
